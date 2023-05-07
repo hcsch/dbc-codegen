@@ -11,7 +11,7 @@ use can_dbc::{Message, MultiplexIndicator, Signal, ValDescription, ValueDescript
 use heck::{ToPascalCase, ToSnakeCase};
 use pad::PadAdapter;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::{BufWriter, Write},
 };
 
@@ -253,7 +253,9 @@ fn render_message(mut w: impl Write, msg: &Message, dbc: &DBC) -> Result<()> {
             match signal.multiplexer_indicator() {
                 MultiplexIndicator::Plain => render_signal(&mut w, signal, dbc, msg)
                     .with_context(|| format!("write signal impl `{}`", signal.name()))?,
-                MultiplexIndicator::Multiplexor => render_multiplexor_signal(&mut w, signal, msg)?,
+                MultiplexIndicator::Multiplexor => {
+                    render_multiplexor_signal(&mut w, signal, dbc, msg)?
+                }
                 MultiplexIndicator::MultiplexedSignal(_) => {}
                 MultiplexIndicator::MultiplexorAndMultiplexedSignal(_) => {}
             }
@@ -312,7 +314,14 @@ fn render_message(mut w: impl Write, msg: &Message, dbc: &DBC) -> Result<()> {
                 return None;
             }
             let signal = dbc.signal_by_name(*message_id, signal_name).unwrap();
-            Some((signal, value_descriptions))
+            // Don't generate an enum for multiplexors, those will have an enum generated separately.
+            match signal.multiplexer_indicator() {
+                MultiplexIndicator::Multiplexor
+                | MultiplexIndicator::MultiplexorAndMultiplexedSignal(_) => None,
+                MultiplexIndicator::MultiplexedSignal(_) | MultiplexIndicator::Plain => {
+                    Some((signal, value_descriptions))
+                }
+            }
         } else {
             None
         }
@@ -510,14 +519,15 @@ fn render_set_signal_multiplexer(
     multiplexor: &Signal,
     msg: &Message,
     switch_index: u64,
+    value_description: Option<&str>,
 ) -> Result<()> {
     writeln!(&mut w, "/// Set value of {}", multiplexor.name())?;
     writeln!(w, "#[inline(always)]")?;
     writeln!(
         w,
         "pub fn set_{enum_variant_wrapper}(&mut self, value: {enum_variant}) -> Result<(), CanError> {{",
-        enum_variant_wrapper = multiplexed_enum_variant_wrapper_name(switch_index).to_snake_case(),
-        enum_variant = multiplexed_enum_variant_name(msg, multiplexor, switch_index)?,
+        enum_variant_wrapper = multiplexed_enum_variant_wrapper_name(switch_index, value_description).to_snake_case(),
+        enum_variant = multiplexed_enum_variant_name(msg, multiplexor, switch_index, value_description)?,
     )?;
 
     {
@@ -541,7 +551,12 @@ fn render_set_signal_multiplexer(
     Ok(())
 }
 
-fn render_multiplexor_signal(mut w: impl Write, signal: &Signal, msg: &Message) -> Result<()> {
+fn render_multiplexor_signal(
+    mut w: impl Write,
+    signal: &Signal,
+    dbc: &DBC,
+    msg: &Message,
+) -> Result<()> {
     writeln!(w, "/// Get raw value of {}", signal.name())?;
     writeln!(w, "///")?;
     writeln!(w, "/// - Start bit: {}", signal.start_bit)?;
@@ -571,6 +586,25 @@ fn render_multiplexor_signal(mut w: impl Write, signal: &Signal, msg: &Message) 
         multiplex_enum_name(msg, signal)?
     )?;
 
+    let value_descriptions = dbc
+        .value_descriptions_for_signal(*msg.message_id(), signal.name())
+        .unwrap_or(&[])
+        .iter()
+        .map(|vd| {
+            Ok((
+                try_f64_to_unique_u64(*vd.a()).with_context(|| {
+                    format!(
+                        "multiplexor signal {} of message {} has a value description for {} which isn't a non-negative integer",
+                        signal.name(),
+                        msg.message_name(),
+                        vd.a()
+                    )
+                })?,
+                vd.b().to_owned(),
+            ))
+        })
+        .collect::<Result<HashMap<u64, String>>>()?;
+
     let multiplexer_indexes: BTreeSet<u64> = msg
         .signals()
         .iter()
@@ -591,14 +625,15 @@ fn render_multiplexor_signal(mut w: impl Write, signal: &Signal, msg: &Message) 
         {
             let mut w = PadAdapter::wrap(&mut w);
             for multiplexer_index in multiplexer_indexes.iter() {
+                let value_description = value_descriptions.get(multiplexer_index).map(|vd| &**vd);
                 writeln!(
                     &mut w,
                     "{idx} => Ok({enum_name}::{multiplexed_wrapper_name}({multiplexed_name}{{ raw: self.raw }})),",
                     idx = multiplexer_index,
                     enum_name = multiplex_enum_name(msg, signal)?,
-                    multiplexed_wrapper_name = multiplexed_enum_variant_wrapper_name(*multiplexer_index),
+                    multiplexed_wrapper_name = multiplexed_enum_variant_wrapper_name(*multiplexer_index, value_description),
                     multiplexed_name =
-                        multiplexed_enum_variant_name(msg, signal, *multiplexer_index)?
+                        multiplexed_enum_variant_name(msg, signal, *multiplexer_index, value_description)?
                 )?;
             }
             writeln!(
@@ -626,7 +661,8 @@ fn render_multiplexor_signal(mut w: impl Write, signal: &Signal, msg: &Message) 
     }
 
     for switch_index in multiplexer_indexes {
-        render_set_signal_multiplexer(&mut w, signal, msg, switch_index)?;
+        let value_description = value_descriptions.get(&switch_index).map(|vd| &**vd);
+        render_set_signal_multiplexer(&mut w, signal, msg, switch_index, value_description)?;
     }
 
     Ok(())
@@ -923,8 +959,15 @@ fn enum_variant_name(x: &str) -> String {
     }
 }
 
-fn multiplexed_enum_variant_wrapper_name(switch_index: u64) -> String {
-    format!("M{}", switch_index)
+fn multiplexed_enum_variant_wrapper_name(
+    switch_index: u64,
+    value_description: Option<&str>,
+) -> String {
+    if let Some(value_description) = value_description {
+        value_description.to_pascal_case()
+    } else {
+        format!("M{}", switch_index)
+    }
 }
 
 fn multiplex_enum_name(msg: &Message, multiplexor: &Signal) -> Result<String> {
@@ -947,6 +990,7 @@ fn multiplexed_enum_variant_name(
     msg: &Message,
     multiplexor: &Signal,
     switch_index: u64,
+    value_description: Option<&str>,
 ) -> Result<String> {
     ensure!(
         matches!(
@@ -957,12 +1001,21 @@ fn multiplexed_enum_variant_name(
         multiplexor
     );
 
-    Ok(format!(
-        "{}{}M{}",
-        msg.message_name().to_pascal_case(),
-        multiplexor.name().to_pascal_case(),
-        switch_index
-    ))
+    if let Some(value_description) = value_description {
+        Ok(format!(
+            "{}{}{}",
+            msg.message_name().to_pascal_case(),
+            multiplexor.name().to_pascal_case(),
+            value_description.to_pascal_case(),
+        ))
+    } else {
+        Ok(format!(
+            "{}{}M{}",
+            msg.message_name().to_pascal_case(),
+            multiplexor.name().to_pascal_case(),
+            switch_index
+        ))
+    }
 }
 
 fn render_debug_impl(mut w: impl Write, msg: &Message) -> Result<()> {
@@ -1045,15 +1098,40 @@ fn render_multiplexor_enums(
         multiplex_enum_name(msg, multiplexor_signal)?
     )?;
 
+    let value_descriptions = dbc
+        .value_descriptions_for_signal(*msg.message_id(), multiplexor_signal.name())
+        .unwrap_or(&[])
+        .iter()
+        .map(|vd| {
+            Ok((
+                try_f64_to_unique_u64(*vd.a()).with_context(|| {
+                    format!(
+                        "multiplexor signal {} of message {} has a value description for {} which isn't a non-negative integer",
+                        multiplexor_signal.name(),
+                        msg.message_name(),
+                        vd.a()
+                    )
+                })?,
+                vd.b().to_owned(),
+            ))
+        })
+        .collect::<Result<HashMap<u64, String>>>()?;
+
     {
         let mut w = PadAdapter::wrap(&mut w);
         for (switch_index, _multiplexed_signals) in multiplexed_signals.iter() {
+            let value_description = value_descriptions.get(switch_index).map(|vd| &**vd);
             writeln!(
                 w,
                 "{multiplexed_wrapper_name}({multiplexed_name}),",
-                multiplexed_wrapper_name = multiplexed_enum_variant_wrapper_name(**switch_index),
-                multiplexed_name =
-                    multiplexed_enum_variant_name(msg, multiplexor_signal, **switch_index)?
+                multiplexed_wrapper_name =
+                    multiplexed_enum_variant_wrapper_name(**switch_index, value_description),
+                multiplexed_name = multiplexed_enum_variant_name(
+                    msg,
+                    multiplexor_signal,
+                    **switch_index,
+                    value_description
+                )?
             )?;
         }
     }
@@ -1063,7 +1141,13 @@ fn render_multiplexor_enums(
     for (switch_index, multiplexed_signals) in multiplexed_signals.iter() {
         writeln!(w, r##"#[derive(Default)]"##)?;
         writeln!(w, r##"#[cfg_attr(feature = "debug", derive(Debug))]"##)?;
-        let struct_name = multiplexed_enum_variant_name(msg, multiplexor_signal, **switch_index)?;
+        let value_description = value_descriptions.get(switch_index).map(|vd| &**vd);
+        let struct_name = multiplexed_enum_variant_name(
+            msg,
+            multiplexor_signal,
+            **switch_index,
+            value_description,
+        )?;
         writeln!(
             w,
             "pub struct {} {{ raw: [u8; {}] }}",
@@ -1159,4 +1243,15 @@ fn signal_to_arbitrary(signal: &Signal) -> String {
             max = signal.max()
         )
     }
+}
+
+fn try_f64_to_unique_u64(value: f64) -> Result<u64> {
+    ensure!(!value.is_sign_negative(), "value must be non-negative",);
+    ensure!(value.fract() == 0.0, "value must be integral",);
+    ensure!(
+        value < (1_u64 << f64::MANTISSA_DIGITS) as f64,
+        "value must be an integer exactly representable as an f64 (< (1 << 53))",
+    );
+
+    Ok(value as u64)
 }
